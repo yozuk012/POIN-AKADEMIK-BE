@@ -1,0 +1,995 @@
+import Mahasiswa from "../models/mahasiswaModel.js";
+import User from "../models/userModel.js";
+import KlaimKegiatan from "../models/klaimKegiatanModel.js";
+import MasterPoin from "../models/masterpoinModel.js";
+import { generateCVPdf } from "../utils/puppeteerCV.js";
+import sequelize from "../config/db.js";
+import { google } from "googleapis";
+import XLSX from "xlsx";
+import bcrypt from "bcryptjs";
+import fs from "fs";
+import path from "path";
+import moment from "moment";
+import {
+  normalizeMahasiswaRow,
+  normalizeExportRow,
+} from "../controllers/FungsiFilter.js";
+
+import {
+  uploadToDrive,
+  deleteFromDrive,
+  bufferToTempFile,
+  updateFile,
+  deleteLocalFile,
+  DRIVE_FOLDER_IMAGES,
+  streamFileFromDrive,
+} from "../utils/uploadToDrive.js";
+
+// ======================================================
+// ✅ GET SEMUA MAHASISWA (fix normalisasi angka)
+// ======================================================
+
+export const getAllMahasiswa = async (req, res) => {
+  try {
+    const raw = await Mahasiswa.findAll({
+      order: [
+        // 1️⃣ Mahasiswa yang punya poin (> 0) di atas
+        [
+          sequelize.literal("CASE WHEN total_poin > 0 THEN 0 ELSE 1 END"),
+          "ASC",
+        ],
+
+        // 2️⃣ Ranking poin: terbesar → terkecil
+        ["total_poin", "DESC"],
+
+        // 3️⃣ Mahasiswa poin = 0 → urut waktu masuk (data baru di bawah)
+        ["createdAt", "ASC"],
+      ],
+    });
+
+    const data = raw.map((m) => ({
+      ...m.dataValues,
+
+      // ❌ jangan kirim URL drive
+      foto: null,
+
+      // ✅ kirim file id saja
+      foto_file_id: m.foto_file_id,
+
+      // 🔥 pastikan numeric (penting untuk FE)
+      total_poin: Number(m.total_poin) || 0,
+      target_poin: Number(m.target_poin) || 0,
+    }));
+
+    res.json(data);
+  } catch (err) {
+    console.error("getAllMahasiswa error:", err);
+    res.status(500).json({ message: err.message });
+  }
+};
+
+// ======================================================
+// ✅ GET BIODATA MAHASISWA LOGIN
+// ======================================================
+export const getMahasiswaMe = async (req, res) => {
+  try {
+    const { nim, role } = req.user;
+
+    if (role !== "mahasiswa") {
+      return res
+        .status(403)
+        .json({ message: "Hanya mahasiswa yang dapat mengakses endpoint ini" });
+    }
+
+    const mhs = await Mahasiswa.findOne({ where: { nim } });
+    if (!mhs) {
+      return res.status(404).json({ message: "Mahasiswa tidak ditemukan" });
+    }
+
+    const result = {
+      id: mhs.id_mhs,
+      nim: mhs.nim,
+      nama_mhs: mhs.nama_mhs,
+      prodi: mhs.prodi,
+      angkatan: mhs.angkatan,
+
+      tempat_lahir: mhs.tempat_lahir,
+      tgl_lahir: mhs.tgl_lahir,
+      alamat: mhs.alamat,
+
+      tlp_saya: mhs.tlp_saya,
+      email: mhs.email,
+      jenis_kelamin: mhs.jenis_kelamin,
+
+      // 🔥 INI KUNCI UTAMA
+      foto_file_id: mhs.foto_file_id || null,
+
+      target_poin: Number(mhs.target_poin) || 0,
+      total_poin: Number(mhs.total_poin) || 0,
+    };
+
+    return res.json({ message: "OK", data: result });
+  } catch (err) {
+    return res.status(500).json({ message: err.message });
+  }
+};
+
+// ======================================================
+// ✅ GET MAHASISWA BY ID
+// ======================================================
+export const getMahasiswaById = async (req, res) => {
+  try {
+    const data = await Mahasiswa.findByPk(req.params.id);
+    if (!data) return res.status(404).json({ message: "Mahasiswa not found" });
+    res.json(data);
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+};
+
+export const getMahasiswaCV = async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // =========================
+    // AMBIL DATA MAHASISWA
+    // =========================
+    const mhs = await Mahasiswa.findByPk(id);
+    if (!mhs) {
+      return res.status(404).json({
+        message: "Mahasiswa tidak ditemukan",
+      });
+    }
+
+    // =========================
+    // AMBIL KEGIATAN DISETUJUI
+    // =========================
+    const kegiatan = await KlaimKegiatan.findAll({
+      where: {
+        mahasiswa_id: id,
+        status: "Disetujui",
+      },
+      include: [
+        {
+          model: MasterPoin,
+          as: "masterPoin",
+        },
+      ],
+      order: [["tanggal_pelaksanaan", "DESC"]],
+    });
+
+    // =========================
+    // FORMAT DATA KEGIATAN (KUNCI UTAMA)
+    // =========================
+    const formatData = kegiatan.map((item) => ({
+      id: item.id,
+
+      // 🔑 KODE UNTUK KATEGORISASI
+      kode: item.masterPoin?.kode_keg || "",
+
+      // 🔑 NAMA MASTER (STABIL, UNTUK BADGE / KATEGORI)
+      namaKegiatan:
+        item.masterPoin?.nama_kegiatan ||
+        item.masterPoin?.jenis_kegiatan ||
+        "-",
+
+      // 🔥 JUDUL ASLI KEGIATAN (INI YANG DITAMPILKAN)
+      rincianAcara: item.rincian_acara || "-",
+
+      jenis: item.masterPoin?.jenis_kegiatan || "-",
+      posisi: item.masterPoin?.posisi || "-",
+      tingkat: item.tingkat || "-",
+      tanggal: item.tanggal_pelaksanaan,
+      poin: Number(item.poin) || 0,
+    }));
+
+    // =========================
+    // PREFIX FILTER
+    // =========================
+    const ORGANISASI_PREFIX = [
+      "BEM",
+      "UKM",
+      "PIK",
+      "OKS",
+      "PKK",
+      "PMS",
+      "PNL",
+      "MNT",
+    ];
+
+    const PRESTASI_PREFIX = ["MDB"];
+
+    const organisasi = formatData.filter((item) =>
+      ORGANISASI_PREFIX.some((p) => item.kode.toUpperCase().startsWith(p)),
+    );
+
+    const prestasi = formatData.filter((item) =>
+      PRESTASI_PREFIX.some((p) => item.kode.toUpperCase().startsWith(p)),
+    );
+
+    // =========================
+    // FORMAT TANGGAL INDONESIA
+    // =========================
+    const formatTanggalIndo = (dateStr) => {
+      if (!dateStr) return "-";
+      const d = new Date(dateStr);
+      return d.toLocaleDateString("id-ID", {
+        day: "2-digit",
+        month: "long",
+        year: "numeric",
+      });
+    };
+
+    // =========================
+    // BIODATA CV (FIX & SIAP CETAK)
+    // =========================
+    const biodata = {
+      id_mhs: mhs.id_mhs,
+      nim: mhs.nim,
+      nama_mhs: mhs.nama_mhs,
+      email: mhs.email,
+      tlp_saya: mhs.tlp_saya,
+      alamat: mhs.alamat,
+      prodi: mhs.prodi,
+      angkatan: mhs.angkatan,
+      jenis_kelamin: mhs.jenis_kelamin,
+
+      // 🔥 FOTO CV
+      foto_file_id: mhs.foto_file_id || null,
+
+      // TTL siap pakai
+      ttl: `${mhs.tempat_lahir || "-"}, ${formatTanggalIndo(mhs.tgl_lahir)}`,
+    };
+
+    // =========================
+    // RESPONSE FINAL
+    // =========================
+    return res.json({
+      message: "OK",
+      biodata,
+      organisasi,
+      prestasi,
+    });
+  } catch (err) {
+    console.error("❌ getMahasiswaCV error:", err);
+    return res.status(500).json({
+      message: "Gagal mengambil data CV mahasiswa",
+    });
+  }
+};
+
+// ======================================================
+// ✅ CREATE MAHASISWA + USER OTOMATIS (VERSI RINGKAS)
+// ======================================================
+export const createMahasiswa = async (req, res) => {
+  try {
+    const payload = req.body;
+
+    // ================================
+    // CEK DUPLIKAT NIM
+    // ================================
+    const exist = await Mahasiswa.findOne({
+      where: { nim: payload.nim },
+    });
+
+    if (exist) {
+      return res.status(400).json({
+        message: "Validasi gagal",
+        errors: {
+          nim: "NIM sudah terdaftar",
+        },
+      });
+    }
+
+    // ================================
+    // 🔥 AMBIL ORDER_INDEX TERAKHIR
+    // ================================
+    const maxOrder = await Mahasiswa.max("order_index");
+
+    // ================================
+    // UPLOAD FOTO KE GOOGLE DRIVE
+    // ================================
+    let fotoFileId = null;
+
+    if (req.file && req.file.buffer) {
+      const tempFile = bufferToTempFile(req.file.buffer, req.file.originalname);
+
+      const uploaded = await uploadToDrive(
+        tempFile,
+        req.file.mimetype,
+        DRIVE_FOLDER_IMAGES
+      );
+
+      fotoFileId = uploaded.id;
+      deleteLocalFile(tempFile);
+    }
+
+    // ================================
+    // CREATE MAHASISWA
+    // ================================
+    const mahasiswa = await Mahasiswa.create({
+      ...payload,
+      tempat_lahir: payload.tempat_lahir || null,
+      foto_file_id: fotoFileId,
+      target_poin: Number(payload.target_poin) || 0,
+      total_poin: Number(payload.total_poin) || 0,
+
+      // 🔥 KUNCI URUTAN STABIL
+      order_index: (maxOrder || 0) + 1,
+    });
+
+    // ================================
+    // CREATE USER OTOMATIS
+    // ================================
+    const hashedPassword = await bcrypt.hash(mahasiswa.nim, 10);
+
+    await User.create({
+      nim: mahasiswa.nim,
+      password: hashedPassword,
+      role: "mahasiswa",
+    });
+
+    return res.status(201).json({
+      message: "Mahasiswa & akun berhasil dibuat",
+      mahasiswa,
+    });
+  } catch (err) {
+    console.error("CREATE MAHASISWA ERROR:", err);
+
+    return res.status(500).json({
+      message: "Terjadi kesalahan server",
+    });
+  }
+};
+
+// ======================================================
+// ✅ UPDATE MAHASISWA
+// ======================================================
+
+
+export const updateMahasiswa = async (req, res) => {
+  try {
+    // ===============================
+    // AMBIL DATA MAHASISWA
+    // ===============================
+    const data = await Mahasiswa.findByPk(req.params.id);
+
+    if (!data) {
+      return res.status(404).json({
+        message: "Mahasiswa tidak ditemukan",
+      });
+    }
+
+    // ===============================
+    // WHITELIST FIELD YANG BOLEH DIUPDATE
+    // ===============================
+    const allowedFields = [
+      "nim",
+      "nama_mhs",
+      "prodi",
+      "angkatan",
+      "alamat",
+      "asal_sekolah",
+      "email",
+      "jenis_kelamin",
+      "tempat_lahir",
+      "tgl_lahir", // ✅ FIX UTAMA
+      "thn_lulus",
+      "target_poin",
+      "total_poin",
+    ];
+
+    let updates = {};
+    for (const key of allowedFields) {
+      if (req.body[key] !== undefined) {
+        updates[key] = req.body[key];
+      }
+    }
+
+    // ===============================
+    // NORMALISASI TANGGAL LAHIR (AMAN)
+    // ===============================
+    if (updates.tgl_lahir) {
+      // Jika sudah ISO (YYYY-MM-DD) → langsung pakai
+      if (moment(updates.tgl_lahir, "YYYY-MM-DD", true).isValid()) {
+        updates.tgl_lahir = moment(updates.tgl_lahir).format("YYYY-MM-DD");
+      }
+      // Jika DD-MM-YYYY → konversi
+      else if (moment(updates.tgl_lahir, "DD-MM-YYYY", true).isValid()) {
+        updates.tgl_lahir = moment(updates.tgl_lahir, "DD-MM-YYYY").format(
+          "YYYY-MM-DD",
+        );
+      } else {
+        return res.status(400).json({
+          message: "Format tanggal lahir tidak valid",
+          errors: {
+            tgl_lahir: "Gunakan format YYYY-MM-DD atau DD-MM-YYYY",
+          },
+        });
+      }
+    }
+
+    // ===============================
+    // CEK DUPLIKAT NIM (JIKA DIUBAH)
+    // ===============================
+    if (updates.nim && updates.nim !== data.nim) {
+      const exist = await Mahasiswa.findOne({
+        where: { nim: updates.nim },
+      });
+
+      if (exist) {
+        return res.status(400).json({
+          message: "Validasi gagal",
+          errors: {
+            nim: "NIM sudah digunakan mahasiswa lain",
+          },
+        });
+      }
+    }
+
+    // ===============================
+    // UPDATE FOTO (OPSIONAL)
+    // ===============================
+    if (req.file && req.file.buffer) {
+      const tempFile = bufferToTempFile(req.file.buffer, req.file.originalname);
+
+      if (data.foto_file_id) {
+        await updateFile(data.foto_file_id, tempFile, req.file.mimetype);
+        updates.foto_file_id = data.foto_file_id;
+      } else {
+        const uploaded = await uploadToDrive(
+          tempFile,
+          req.file.mimetype,
+          DRIVE_FOLDER_IMAGES,
+        );
+        updates.foto_file_id = uploaded.id;
+      }
+
+      deleteLocalFile(tempFile);
+    }
+
+    // ===============================
+    // NORMALISASI FIELD NUMERIC
+    // ===============================
+    if (updates.target_poin !== undefined) {
+      updates.target_poin = Number(updates.target_poin);
+    }
+
+    if (updates.total_poin !== undefined) {
+      updates.total_poin = Number(updates.total_poin);
+    }
+
+    // ===============================
+    // SIMPAN KE DATABASE
+    // ===============================
+    await data.update(updates);
+
+    const updated = await Mahasiswa.findByPk(req.params.id);
+
+    return res.json({
+      message: "Mahasiswa berhasil diupdate",
+      mahasiswa: updated,
+    });
+  } catch (err) {
+    console.error("UPDATE MAHASISWA ERROR:", err);
+
+    return res.status(500).json({
+      message: "Terjadi kesalahan server",
+    });
+  }
+};
+
+// ======================================================
+// ✅ DELETE MAHASISWA
+// ======================================================
+export const deleteMahasiswa = async (req, res) => {
+  try {
+    const data = await Mahasiswa.findByPk(req.params.id);
+    if (!data) {
+      return res.status(404).json({ message: "Mahasiswa not found" });
+    }
+
+    // ============================
+    // HAPUS FOTO DI GOOGLE DRIVE
+    // (BEST-EFFORT, JANGAN BLOKIR)
+    // ============================
+    if (data.foto_file_id) {
+      try {
+        await deleteFromDrive(data.foto_file_id);
+      } catch (err) {
+        console.warn(
+          "[INFO] Drive cleanup dilewati (akses terbatas):",
+          data.foto_file_id
+        );
+      }
+    }
+
+    // ============================
+    // HAPUS USER TERKAIT
+    // ============================
+    await User.destroy({ where: { nim: data.nim } });
+
+    // ============================
+    // HAPUS DATA MAHASISWA
+    // ============================
+    await data.destroy();
+
+    return res.json({
+      message:
+        "Mahasiswa berhasil dihapus (file Drive dihapus jika memiliki akses)",
+    });
+  } catch (err) {
+    console.error("DELETE MAHASISWA ERROR:", err);
+    return res.status(500).json({ message: "Gagal menghapus mahasiswa" });
+  }
+};
+
+
+// ======================================================
+// ✅ GET KEGIATAN DETAIL UNTUK MODAL (ORGANISASI + PRESTASI + SEMUA)
+// ======================================================
+export const getMahasiswaKegiatan = async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // 1️⃣ Cek mahasiswa
+    const mahasiswa = await Mahasiswa.findByPk(id);
+    if (!mahasiswa) {
+      return res.status(404).json({ message: "Mahasiswa tidak ditemukan" });
+    }
+
+    // 2️⃣ Ambil semua klaim kegiatan Disetujui
+    const kegiatan = await KlaimKegiatan.findAll({
+      where: {
+        mahasiswa_id: id,
+        status: "Disetujui", // pastikan di DB ada
+      },
+      include: [
+        {
+          model: MasterPoin,
+          as: "masterPoin",
+        },
+      ],
+      order: [["tanggal_pelaksanaan", "DESC"]],
+    });
+
+    // 🔹 DEBUG: jika kosong
+    if (kegiatan.length === 0) {
+      console.log(`⚠️ Mahasiswa ${id} tidak punya kegiatan disetujui`);
+    }
+
+    // 3️⃣ Format data untuk FE
+    const formatData = kegiatan.map((item) => ({
+      id: item.id,
+      kode: item.masterPoin?.kode_keg || "",
+
+      // Tetap ada namaKegiatan untuk FE lama
+      namaKegiatan: item.masterPoin?.nama_kegiatan || "-",
+
+      // 🔑 Tambah field baru rincianAcara
+      rincianAcara: item.rincian_acara || item.masterPoin?.nama_kegiatan || "-", // fallback ke nama_kegiatan jika rincian kosong
+
+      posisi: item.masterPoin?.posisi || "-",
+      jenis: item.masterPoin?.jenis_kegiatan || "-",
+      tingkat: item.tingkat || "-",
+
+      tanggal: item.tanggal_pelaksanaan,
+      poin: Number(item.poin) || 0,
+    }));
+
+    // 4️⃣ Kategorisasi
+    const ORGANISASI_PREFIX = [
+      "BEM",
+      "UKM",
+      "PIK",
+      "OKS",
+      "PKK",
+      "PMS",
+      "PNL",
+      "MNT",
+    ];
+    const PRESTASI_PREFIX = ["MDB"];
+
+    const organisasi = formatData.filter((item) =>
+      ORGANISASI_PREFIX.some((p) => item.kode.toUpperCase().startsWith(p)),
+    );
+
+    const prestasi = formatData.filter((item) =>
+      PRESTASI_PREFIX.some((p) => item.kode.toUpperCase().startsWith(p)),
+    );
+
+    // 5️⃣ Response
+    return res.json({
+      message: "OK",
+      data: formatData,
+      organisasi,
+      prestasi,
+    });
+  } catch (err) {
+    console.error("❌ getMahasiswaKegiatan error:", err);
+    res.status(500).json({
+      message: "Gagal mengambil data kegiatan mahasiswa",
+    });
+  }
+};
+
+
+export const importMahasiswaExcel = async (req, res) => {
+  console.log("\n================= [IMPORT MAHASISWA EXCEL] =================");
+
+  try {
+    // ======================================================
+    // VALIDASI FILE
+    // ======================================================
+    if (!req.file || !req.file.buffer) {
+      console.error("[IMPORT] ❌ File / buffer tidak ditemukan");
+      return res.status(400).json({ message: "File Excel belum diupload" });
+    }
+
+    // ======================================================
+    // BACA EXCEL DARI BUFFER
+    // ======================================================
+    const workbook = XLSX.read(req.file.buffer, { type: "buffer" });
+    const sheet = workbook.Sheets[workbook.SheetNames[0]];
+    const rows = XLSX.utils.sheet_to_json(sheet, {
+      defval: "",
+      raw: false,
+    });
+
+    if (rows.length === 0) {
+      console.error("[IMPORT] ❌ File Excel kosong");
+      return res.status(400).json({ message: "File Excel kosong" });
+    }
+
+    console.log(`[IMPORT] 📄 Total row excel: ${rows.length}`);
+
+    // ======================================================
+    // COUNTER
+    // ======================================================
+    let inserted = 0;
+    let failed = 0;
+
+    let skipEmpty = 0;
+    let skipDuplicateExcel = 0;
+    let skipDuplicateDB = 0;
+
+    const rowErrors = [];
+    const seenNim = new Set();
+
+    // ======================================================
+    // LOOP DATA
+    // ======================================================
+    for (let i = 0; i < rows.length; i++) {
+      const raw = rows[i];
+      const excelRow = i + 2;
+
+      let nim = raw.nim ? String(raw.nim).trim() : null;
+      let nama = raw.nama_mhs || "-";
+
+      try {
+        console.log(`\n[ROW ${excelRow}] ▶️ Mulai proses`);
+        console.log(`[ROW ${excelRow}] NIM: ${nim || "-"}`);
+        console.log(`[ROW ${excelRow}] Nama: ${nama}`);
+
+        // ======================================================
+        // VALIDASI WAJIB
+        // ======================================================
+        if (!nim || !raw.nama_mhs) {
+          skipEmpty++;
+          console.warn(`[ROW ${excelRow}] ⏭ SKIP → NIM atau Nama kosong`);
+          rowErrors.push({
+            rowIndex: excelRow,
+            nim,
+            reason: "NIM atau Nama kosong",
+          });
+          continue;
+        }
+
+        const row = normalizeMahasiswaRow(raw);
+
+        // ======================================================
+        // DUPLIKAT DI FILE
+        // ======================================================
+        if (seenNim.has(row.nim)) {
+          skipDuplicateExcel++;
+          console.warn(
+            `[ROW ${excelRow}] ⏭ SKIP → Duplikat NIM di file (${row.nim})`
+          );
+          rowErrors.push({
+            rowIndex: excelRow,
+            nim: row.nim,
+            reason: "Duplikat NIM di file Excel",
+          });
+          continue;
+        }
+        seenNim.add(row.nim);
+
+        // ======================================================
+        // DUPLIKAT DI DATABASE
+        // ======================================================
+        const exist = await Mahasiswa.findOne({
+          where: { nim: row.nim },
+        });
+
+        if (exist) {
+          skipDuplicateDB++;
+          console.warn(
+            `[ROW ${excelRow}] ⏭ SKIP → NIM ${row.nim} sudah ada di database`
+          );
+          rowErrors.push({
+            rowIndex: excelRow,
+            nim: row.nim,
+            reason: "NIM sudah ada di database",
+          });
+          continue;
+        }
+
+        // ======================================================
+        // NORMALISASI DATA
+        // ======================================================
+        const safeProdi =
+          row.prodi && row.prodi.trim() !== "" ? row.prodi : "BELUM DIISI";
+
+        const safeAlamat =
+          row.alamat && row.alamat.trim() !== "" ? row.alamat : "-";
+
+        const safeAsalSekolah =
+          row.asal_sekolah && row.asal_sekolah.trim() !== ""
+            ? row.asal_sekolah
+            : "-";
+
+        const safeAngkatan =
+          row.angkatan && /\d{4}/.test(row.angkatan)
+            ? row.angkatan.match(/\d{4}/)[0]
+            : null;
+
+        const safeThnLulus =
+          row.thn_lulus && /\d{4}/.test(row.thn_lulus)
+            ? row.thn_lulus.match(/\d{4}/)[0]
+            : null;
+
+        const jk = row.jenis_kelamin?.toString().toLowerCase();
+        const safeJenisKelamin = jk?.startsWith("l")
+          ? "L"
+          : jk?.startsWith("p")
+          ? "P"
+          : null;
+
+        const safeTanggalLahir =
+          row.tgl_lahir && /^\d{4}-\d{2}-\d{2}$/.test(row.tgl_lahir)
+            ? row.tgl_lahir
+            : null;
+
+        // ======================================================
+        // INSERT MAHASISWA
+        // ======================================================
+        await Mahasiswa.create({
+          nim: row.nim,
+          nama_mhs: row.nama_mhs,
+          prodi: safeProdi,
+          angkatan: safeAngkatan,
+          tempat_lahir: row.tempat_lahir || "-",
+          tgl_lahir: safeTanggalLahir,
+          target_poin: Number(row.target_poin) || 50,
+          total_poin: Number(row.total_poin) || 0,
+          pekerjaan: row.pekerjaan || "-",
+          alamat: safeAlamat,
+          asal_sekolah: safeAsalSekolah,
+          thn_lulus: safeThnLulus,
+          tlp_saya: row.tlp_saya || null,
+          tlp_rumah: row.tlp_rumah || null,
+          email: row.email || null,
+          jenis_kelamin: safeJenisKelamin,
+          foto_file_id: row.foto || null,
+        });
+
+        // ======================================================
+        // USER LOGIN
+        // ======================================================
+        const userExist = await User.findOne({
+          where: { nim: row.nim },
+        });
+
+        if (!userExist) {
+          const hashedPassword = await bcrypt.hash(row.nim.toString(), 10);
+
+          await User.create({
+            nim: row.nim,
+            nama: row.nama_mhs,
+            email: row.email || null,
+            password: hashedPassword,
+            role: "mahasiswa",
+          });
+        }
+
+        inserted++;
+        console.log(
+          `[ROW ${excelRow}] ✅ SUCCESS → ${row.nama_mhs} (${row.nim})`
+        );
+      } catch (errRow) {
+        failed++;
+
+        console.error(`[ROW ${excelRow}] ❌ FAILED → ${nim || "-"} | ${nama}`);
+        console.error(`[ROW ${excelRow}] ❌ REASON: ${errRow.message}`);
+
+        rowErrors.push({
+          rowIndex: excelRow,
+          nim,
+          nama,
+          reason: "Gagal insert",
+          error: errRow.message,
+        });
+      }
+    }
+
+    // ======================================================
+    // SUMMARY LOG
+    // ======================================================
+    console.log("\n================= [IMPORT RESULT] =================");
+    console.log(`✅ Inserted : ${inserted}`);
+    console.log(`❌ Failed   : ${failed}`);
+    console.log(`⏭ Skip Empty        : ${skipEmpty}`);
+    console.log(`⏭ Skip Duplikat Excel: ${skipDuplicateExcel}`);
+    console.log(`⏭ Skip Duplikat DB   : ${skipDuplicateDB}`);
+
+    if (rowErrors.length > 0) {
+      console.log("❌ DETAIL ERROR:");
+      rowErrors.forEach((e) => {
+        console.log(
+          `   - Row ${e.rowIndex} | NIM ${e.nim || "-"} | ${e.nama || "-"} → ${
+            e.reason || e.error
+          }`
+        );
+      });
+    }
+
+    console.log("==================================================\n");
+
+    // ======================================================
+    // RESPONSE
+    // ======================================================
+    return res.json({
+      message: "Import Mahasiswa selesai",
+      total_row_excel: rows.length,
+      berhasil: inserted,
+      gagal: failed,
+      skip: {
+        nim_nama_kosong: skipEmpty,
+        duplikat_excel: skipDuplicateExcel,
+        sudah_ada_db: skipDuplicateDB,
+      },
+      detail_error: rowErrors,
+    });
+  } catch (err) {
+    console.error("💥 IMPORT MAHASISWA FATAL ERROR:", err);
+    return res.status(500).json({ message: err.message });
+  }
+};
+
+
+export const exportMahasiswaExcel = async (req, res) => {
+  try {
+    const data = await Mahasiswa.findAll();
+
+    // =========================================================
+    // NORMALISASI ROW MENGGUNAKAN FILTER
+    // =========================================================
+    const rows = data.map((m) => {
+      const row = normalizeExportRow(m);
+
+      // 🔥 Foto: hanya tampilkan nama file tanpa /uploads/
+      if (row.foto) {
+        row.foto = row.foto.replace("/uploads/", "").trim();
+      } else {
+        row.foto = ""; // excel tidak suka null
+      }
+
+      return row;
+    });
+
+    // =========================================================
+    // BUAT SHEET XLSX
+    // =========================================================
+    const worksheet = XLSX.utils.json_to_sheet(rows);
+    const workbook = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(workbook, worksheet, "Mahasiswa");
+
+    const buffer = XLSX.write(workbook, {
+      type: "buffer",
+      bookType: "xlsx",
+    });
+
+    res.setHeader(
+      "Content-Disposition",
+      "attachment; filename=Mahasiswa_Export.xlsx"
+    );
+    res.setHeader(
+      "Content-Type",
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    );
+
+    return res.send(buffer);
+  } catch (err) {
+    console.error("❌ EXPORT ERROR:", err);
+    return res.status(500).json({ message: err.message });
+  }
+};
+
+export const cetakCvPdf = async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // 🔥 Ambil data mahasiswa
+    const mhs = await Mahasiswa.findByPk(id);
+
+    if (!mhs) {
+      return res.status(404).json({ message: "Mahasiswa tidak ditemukan" });
+    }
+
+    // 🔹 Normalisasi nama file
+    const nim = mhs.nim;
+    const nama = mhs.nama_mhs
+      .toUpperCase()
+      .replace(/\s+/g, "_") // spasi → _
+      .replace(/[^A-Z0-9_]/g, ""); // hapus karakter aneh
+
+    const filename = `CV_${nim}_${nama}.pdf`;
+
+    // 🔥 URL halaman CV (print-only)
+    const cvUrl = `http://localhost:3000/cv/${id}`;
+
+    console.log("🖨️ Generate CV:", filename);
+    console.log("🔗 From URL:", cvUrl);
+
+    const pdfBuffer = await generateCVPdf(cvUrl);
+
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+
+    res.send(pdfBuffer);
+  } catch (error) {
+    console.error("❌ Gagal generate PDF:", error);
+    res.status(500).json({
+      message: "Gagal generate CV PDF",
+    });
+  }
+};
+
+// ===============================
+// ✅ STREAM FOTO MAHASISWA (FINAL - ENV BASE64)
+// ===============================
+export const streamFotoMahasiswa = async (req, res) => {
+  try {
+    const { fileId } = req.params;
+
+    if (!fileId) {
+      return res.status(400).json({ message: "File ID tidak valid" });
+    }
+
+    const { stream, headers } = await streamFileFromDrive(fileId);
+
+    // ===============================
+    // 🔥 HEADER PENTING (ANTI CACHE)
+    // ===============================
+    res.setHeader("Content-Type", headers?.["content-type"] || "image/jpeg");
+
+    // ⛔ MATIKAN CACHE TOTAL
+    res.setHeader(
+      "Cache-Control",
+      "no-store, no-cache, must-revalidate, proxy-revalidate"
+    );
+    res.setHeader("Pragma", "no-cache");
+    res.setHeader("Expires", "0");
+
+    // (opsional) untuk proxy / CDN
+    res.setHeader("Surrogate-Control", "no-store");
+
+    // ===============================
+    // STREAM FILE
+    // ===============================
+    stream.pipe(res);
+  } catch (error) {
+    console.error("❌ Stream foto gagal:", error.message);
+    res.status(404).end();
+  }
+};
